@@ -1,0 +1,152 @@
+<?php
+
+/**
+ * @file
+ * Install/update hooks for advanced_image_style_warmer.
+ */
+
+use Drupal\Core\Config\FileStorage;
+
+/**
+ * Implements hook_install().
+ */
+function advanced_image_style_warmer_install() {
+  // Run after typical file/image hooks; mirrors legacy image_style_warmer.
+  module_set_weight('advanced_image_style_warmer', 10);
+}
+
+/**
+ * Implements hook_schema().
+ */
+function advanced_image_style_warmer_schema() {
+  $schema['advanced_image_style_warmer_registry'] = [
+    'description' => 'Stateful registry tracking which image-style derivatives have been warmed for which file IDs.',
+    'fields' => [
+      'fid' => [
+        'description' => 'File ID from file_managed.',
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+      ],
+      'style_name' => [
+        'description' => 'Image style machine name.',
+        'type' => 'varchar',
+        'length' => 128,
+        'not null' => TRUE,
+      ],
+      'warmed' => [
+        'description' => '0 = pending, 1 = warmed.',
+        'type' => 'int',
+        'size' => 'tiny',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+        'default' => 0,
+      ],
+      'in_queue' => [
+        'description' => '1 = a queue item is already pending for this fid/style.',
+        'type' => 'int',
+        'size' => 'tiny',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+        'default' => 0,
+      ],
+      'timestamp' => [
+        'description' => 'Last update timestamp.',
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+        'default' => 0,
+      ],
+    ],
+    'primary key' => ['fid', 'style_name'],
+    'indexes' => [
+      'warmed_style' => ['style_name', 'warmed'],
+      'fid_warmed' => ['fid', 'warmed'],
+      'fid_in_queue' => ['fid', 'in_queue'],
+    ],
+  ];
+  return $schema;
+}
+
+/**
+ * Implements hook_uninstall().
+ */
+function advanced_image_style_warmer_uninstall($is_syncing) {
+  \Drupal::service('queue')
+    ->get('advanced_image_style_warmer')
+    ->deleteQueue();
+}
+
+/**
+ * Adds in_queue column to the registry (existing sites).
+ */
+function advanced_image_style_warmer_update_10001() {
+  $schema = \Drupal::database()->schema();
+  $table = 'advanced_image_style_warmer_registry';
+  if ($schema->tableExists($table) && !$schema->fieldExists($table, 'in_queue')) {
+    $schema->addField($table, 'in_queue', [
+      'description' => '1 = queue item pending for this fid/style.',
+      'type' => 'int',
+      'size' => 'tiny',
+      'unsigned' => TRUE,
+      'not null' => TRUE,
+      'default' => 0,
+    ]);
+    $schema->addIndex($table, 'fid_in_queue', ['fid', 'in_queue']);
+  }
+  advanced_image_style_warmer_migrate_legacy_settings();
+}
+
+/**
+ * Installs bulk warmup actions (file + optional media).
+ */
+function advanced_image_style_warmer_update_10002() {
+  $path = \Drupal::service('extension.list.module')->getPath('advanced_image_style_warmer');
+  $install = new FileStorage($path . '/config/install');
+  $storage = \Drupal::service('config.storage');
+  if (!$storage->exists('system.action.advanced_image_style_warmer_warmup_file')) {
+    $storage->write(
+      'system.action.advanced_image_style_warmer_warmup_file',
+      $install->read('system.action.advanced_image_style_warmer_warmup_file'),
+    );
+  }
+  if (\Drupal::moduleHandler()->moduleExists('media')) {
+    $optional = new FileStorage($path . '/config/optional');
+    if ($optional->exists('system.action.advanced_image_style_warmer_warmup_media')) {
+      $storage->write(
+        'system.action.advanced_image_style_warmer_warmup_media',
+        $optional->read('system.action.advanced_image_style_warmer_warmup_media'),
+      );
+    }
+  }
+}
+
+/**
+ * Copies image_style_warmer settings into advanced_image_style_warmer.settings.
+ */
+function advanced_image_style_warmer_migrate_legacy_settings(): void {
+  if (!\Drupal::moduleHandler()->moduleExists('image_style_warmer')) {
+    return;
+  }
+  $target = \Drupal::configFactory()->getEditable('advanced_image_style_warmer.settings');
+  if ($target->get('styles')) {
+    return;
+  }
+  $legacy = \Drupal::configFactory()->get('image_style_warmer.settings');
+  $styles = [];
+  foreach (array_keys($legacy->get('initial_image_styles') ?? []) as $name) {
+    $styles[$name] = ['immediate' => TRUE, 'queue' => FALSE];
+  }
+  foreach (array_keys($legacy->get('queue_image_styles') ?? []) as $name) {
+    if (isset($styles[$name])) {
+      $styles[$name]['queue'] = TRUE;
+      $styles[$name]['immediate'] = FALSE;
+    }
+    else {
+      $styles[$name] = ['immediate' => FALSE, 'queue' => TRUE];
+    }
+  }
+  if ($styles) {
+    $target->set('styles', $styles)->save(TRUE);
+  }
+}

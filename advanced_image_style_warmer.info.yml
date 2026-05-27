@@ -1,0 +1,9 @@
+name: 'Advanced Image Style Warmer'
+type: module
+description: 'Enterprise-grade image style warmer for sites with millions of files. Provides per-style immediate/queue/backfill processing backed by a stateful registry.'
+package: Media
+core_version_requirement: ^10 || ^11
+configure: advanced_image_style_warmer.settings_form
+dependencies:
+  - drupal:image
+  - drupal:file

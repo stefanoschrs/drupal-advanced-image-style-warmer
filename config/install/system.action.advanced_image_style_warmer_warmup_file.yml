@@ -1,0 +1,11 @@
+langcode: en
+status: true
+dependencies:
+  module:
+    - file
+    - advanced_image_style_warmer
+id: advanced_image_style_warmer_warmup_file
+label: 'Warm image styles for files'
+type: file
+plugin: advanced_image_style_warmer_warmup_file
+configuration: {  }

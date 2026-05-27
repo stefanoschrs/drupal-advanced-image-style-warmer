@@ -1,0 +1,15 @@
+services:
+  advanced_image_style_warmer.registry:
+    class: Drupal\advanced_image_style_warmer\Registry
+    arguments: ['@database', '@datetime.time']
+
+  advanced_image_style_warmer.warmer:
+    class: Drupal\advanced_image_style_warmer\Warmer
+    arguments:
+      - '@config.factory'
+      - '@entity_type.manager'
+      - '@queue'
+      - '@advanced_image_style_warmer.registry'
+      - '@logger.factory'
+      - '@image.factory'
+      - '@file.validator'

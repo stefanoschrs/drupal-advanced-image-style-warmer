@@ -1,0 +1,5 @@
+advanced_image_style_warmer.settings_form:
+  title: 'Advanced Image Style Warmer'
+  description: 'Configure per-style immediate / queue warming behaviour.'
+  parent: system.admin_config_media
+  route_name: advanced_image_style_warmer.settings_form

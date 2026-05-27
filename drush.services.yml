@@ -1,0 +1,11 @@
+services:
+  advanced_image_style_warmer.commands:
+    class: Drupal\advanced_image_style_warmer\Commands\BackfillCommands
+    arguments:
+      - '@database'
+      - '@advanced_image_style_warmer.warmer'
+      - '@advanced_image_style_warmer.registry'
+      - '@config.factory'
+      - '@entity_type.manager'
+    tags:
+      - { name: drush.command }

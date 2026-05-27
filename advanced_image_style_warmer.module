@@ -1,0 +1,100 @@
+<?php
+
+/**
+ * @file
+ * Hook implementations for advanced_image_style_warmer.
+ */
+
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\file\Entity\File;
+use Drupal\file\FileInterface;
+use Drupal\image\ImageStyleInterface;
+
+/**
+ * Implements hook_ENTITY_insert() for the file entity.
+ */
+function advanced_image_style_warmer_file_insert(EntityInterface $file) {
+  if ($file instanceof FileInterface) {
+    \Drupal::service('advanced_image_style_warmer.warmer')->onFileSave($file);
+  }
+}
+
+/**
+ * Implements hook_ENTITY_update() for the file entity.
+ */
+function advanced_image_style_warmer_file_update(EntityInterface $file) {
+  if (!$file instanceof FileInterface) {
+    return;
+  }
+  $registry = \Drupal::service('advanced_image_style_warmer.registry');
+  $original = $file->getOriginal();
+  if ($original instanceof FileInterface) {
+    $registry->invalidateFileIfSourceChanged(
+      (int) $file->id(),
+      $file->getFileUri(),
+      (int) $file->getSize(),
+      $original->getFileUri(),
+      (int) $original->getSize(),
+    );
+  }
+  \Drupal::service('advanced_image_style_warmer.warmer')->onFileSave($file);
+}
+
+/**
+ * Implements hook_image_style_flush().
+ */
+function advanced_image_style_warmer_image_style_flush(ImageStyleInterface $style, $path = NULL) {
+  $registry = \Drupal::service('advanced_image_style_warmer.registry');
+  if ($path === NULL) {
+    $registry->invalidateStyle($style->id());
+    return;
+  }
+  foreach ((array) $path as $uri) {
+    if (is_string($uri) && $uri !== '') {
+      $registry->invalidateStyleForSourceUri($style->id(), $uri);
+    }
+  }
+}
+
+/**
+ * Implements hook_ENTITY_delete() for the image_style config entity.
+ */
+function advanced_image_style_warmer_image_style_delete(EntityInterface $style) {
+  \Drupal::service('advanced_image_style_warmer.registry')->invalidateStyle($style->id());
+}
+
+/**
+ * Implements hook_ENTITY_delete() for the file entity.
+ */
+function advanced_image_style_warmer_file_delete(EntityInterface $file) {
+  if ($file instanceof FileInterface) {
+    \Drupal::service('advanced_image_style_warmer.registry')->invalidateFile((int) $file->id());
+  }
+}
+
+/**
+ * Warms the backing file when a crop entity changes (Crop module).
+ */
+function advanced_image_style_warmer_crop_warm_from_crop(EntityInterface $crop): void {
+  if ($crop->get('entity_type')->value !== 'file') {
+    return;
+  }
+  $file = File::load($crop->get('entity_id')->value);
+  if ($file) {
+    \Drupal::service('advanced_image_style_warmer.warmer')->warmFile($file);
+  }
+}
+
+/**
+ * Implements hook_ENTITY_insert() for the crop entity.
+ */
+function advanced_image_style_warmer_crop_insert(EntityInterface $entity) {
+  advanced_image_style_warmer_crop_warm_from_crop($entity);
+}
+
+/**
+ * Implements hook_ENTITY_update() for the crop entity.
+ */
+function advanced_image_style_warmer_crop_update(EntityInterface $entity) {
+  advanced_image_style_warmer_crop_warm_from_crop($entity);
+}
