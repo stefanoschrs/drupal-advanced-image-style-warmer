@@ -48,6 +48,7 @@ class BackfillCommands extends DrushCommands {
    * @option min-fid Lower bound (inclusive) — overrides auto-discovery.
    * @option max-fid Upper bound (inclusive) — overrides auto-discovery.
    * @option progress-interval Seconds between heartbeat messages while workers run (0 = off).
+   * @option order Direction to walk FIDs: "desc" (newest first, default) or "asc".
    * @usage drush aisw:backfill --concurrency=8 --chunk-size=5000
    */
   public function backfill(array $options = [
@@ -57,7 +58,14 @@ class BackfillCommands extends DrushCommands {
     'min-fid' => NULL,
     'max-fid' => NULL,
     'progress-interval' => 15,
+    'order' => 'desc',
   ]): int {
+    $order = strtolower(trim((string) ($options['order'] ?? 'desc')));
+    if (!in_array($order, ['desc', 'asc'], TRUE)) {
+      $this->logger()->error('Invalid --order=@o; must be "desc" or "asc".', ['@o' => $options['order']]);
+      return self::EXIT_FAILURE;
+    }
+    $descending = $order === 'desc';
     $styles = $this->resolveStyles($options['styles']);
     if (!$styles) {
       $this->logger()->error('No styles configured or specified. Pass --styles=name1,name2 or configure styles in the admin UI.');
@@ -77,17 +85,18 @@ class BackfillCommands extends DrushCommands {
     $totalChunks = (int) ceil(($max - $min + 1) / $chunkSize);
     $masterStartedAt = microtime(TRUE);
 
-    $sampleCmd = $this->buildWorkerCommand((string) $min, (string) min($min + $chunkSize - 1, $max), $stylesArg);
+    $sampleCmd = $this->buildWorkerCommand((string) $min, (string) min($min + $chunkSize - 1, $max), $stylesArg, $order);
     $this->logBackfill(sprintf(
-      'Backfilling styles [%s] over FIDs %d-%d (%d chunks × ~%d FIDs, concurrency=%d).',
-      $stylesArg, $min, $max, $totalChunks, $chunkSize, $concurrency,
+      'Backfilling styles [%s] over FIDs %d-%d (%d chunks × ~%d FIDs, concurrency=%d, order=%s [%s]).',
+      $stylesArg, $min, $max, $totalChunks, $chunkSize, $concurrency, $order,
+      $descending ? 'newest first' : 'oldest first',
     ));
     $this->logBackfill('Worker command: ' . $this->formatArgv($sampleCmd));
     if ($progressInterval > 0) {
       $this->logBackfill(sprintf('Heartbeat every %d seconds (disable with --progress-interval=0).', $progressInterval));
     }
 
-    $cursor = $min;
+    $cursor = $descending ? $max : $min;
     $running = [];
     $completed = 0;
     $failed = 0;
@@ -95,8 +104,8 @@ class BackfillCommands extends DrushCommands {
     $nextChunk = 1;
     $totals = $this->emptyBackfillTotals();
 
-    $spawn = function (int $start, int $end) use ($stylesArg): array {
-      $cmd = $this->buildWorkerCommand((string) $start, (string) $end, $stylesArg);
+    $spawn = function (int $start, int $end) use ($stylesArg, $order): array {
+      $cmd = $this->buildWorkerCommand((string) $start, (string) $end, $stylesArg, $order);
       $proc = new Process($cmd);
       $proc->setTimeout(NULL);
       if (defined('DRUPAL_ROOT')) {
@@ -106,17 +115,28 @@ class BackfillCommands extends DrushCommands {
       return ['proc' => $proc, 'range' => [$start, $end], 'started' => microtime(TRUE), 'index' => 0];
     };
 
-    while ($cursor <= $max || $running) {
-      while (count($running) < $concurrency && $cursor <= $max) {
-        $end = min($cursor + $chunkSize - 1, $max);
-        $slot = $spawn($cursor, $end);
+    $hasMore = static function () use (&$cursor, $min, $max, $descending): bool {
+      return $descending ? $cursor >= $min : $cursor <= $max;
+    };
+
+    while ($hasMore() || $running) {
+      while (count($running) < $concurrency && $hasMore()) {
+        if ($descending) {
+          $start = max($min, $cursor - $chunkSize + 1);
+          $end = $cursor;
+        }
+        else {
+          $start = $cursor;
+          $end = min($cursor + $chunkSize - 1, $max);
+        }
+        $slot = $spawn($start, $end);
         $slot['index'] = $nextChunk++;
         $running[] = $slot;
         $this->logBackfill(sprintf(
           '[spawn %d/%d] Worker for FIDs %d-%d started.',
-          $slot['index'], $totalChunks, $cursor, $end,
+          $slot['index'], $totalChunks, $start, $end,
         ));
-        $cursor = $end + 1;
+        $cursor = $descending ? $start - 1 : $end + 1;
       }
       // Non-blocking poll.
       foreach ($running as $i => $slot) {
@@ -190,12 +210,17 @@ class BackfillCommands extends DrushCommands {
    * @param int $startFid Inclusive lower FID bound.
    * @param int $endFid Inclusive upper FID bound.
    * @param string $styles Comma-separated style machine names.
+   * @param string $order Iteration order within the range: "desc" (newest first, default) or "asc".
    */
-  public function worker(int $startFid, int $endFid, string $styles): int {
+  public function worker(int $startFid, int $endFid, string $styles, string $order = 'desc'): int {
     $styleNames = array_values(array_filter(array_map('trim', explode(',', $styles))));
     if (!$styleNames) {
       $this->logger()->error('No styles passed to worker.');
       return self::EXIT_FAILURE;
+    }
+    $order = strtolower(trim($order));
+    if (!in_array($order, ['desc', 'asc'], TRUE)) {
+      $order = 'desc';
     }
 
     $base = $this->database->select('file_managed', 'f')
@@ -216,6 +241,7 @@ class BackfillCommands extends DrushCommands {
       ->condition('fid', $endFid, '<=')
       ->condition('status', 1)
       ->condition('filemime', 'image/%', 'LIKE')
+      ->orderBy('fid', $order === 'desc' ? 'DESC' : 'ASC')
       ->execute();
     $warmedFiles = 0;
     $attempted = 0;
@@ -413,7 +439,7 @@ class BackfillCommands extends DrushCommands {
    *
    * @return string[]
    */
-  protected function buildWorkerCommand(string $startFid, string $endFid, string $stylesArg): array {
+  protected function buildWorkerCommand(string $startFid, string $endFid, string $stylesArg, string $order = 'desc'): array {
     $command = array_merge(
       $this->resolveDrushArgvPrefix(),
       [
@@ -421,6 +447,7 @@ class BackfillCommands extends DrushCommands {
         $startFid,
         $endFid,
         $stylesArg,
+        $order,
       ],
       $this->drushGlobalOptionsForSubprocess(),
     );
