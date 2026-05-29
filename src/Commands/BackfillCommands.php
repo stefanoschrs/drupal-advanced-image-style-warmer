@@ -85,7 +85,9 @@ class BackfillCommands extends DrushCommands {
     $totalChunks = (int) ceil(($max - $min + 1) / $chunkSize);
     $masterStartedAt = microtime(TRUE);
 
-    $sampleCmd = $this->buildWorkerCommand((string) $min, (string) min($min + $chunkSize - 1, $max), $stylesArg, $order);
+    $sampleStart = $descending ? max($min, $max - $chunkSize + 1) : $min;
+    $sampleEnd = $descending ? $max : min($min + $chunkSize - 1, $max);
+    $sampleCmd = $this->buildWorkerCommand((string) $sampleStart, (string) $sampleEnd, $stylesArg, $order);
     $this->logBackfill(sprintf(
       'Backfilling styles [%s] over FIDs %d-%d (%d chunks × ~%d FIDs, concurrency=%d, order=%s [%s]).',
       $stylesArg, $min, $max, $totalChunks, $chunkSize, $concurrency, $order,
@@ -112,7 +114,14 @@ class BackfillCommands extends DrushCommands {
         $proc->setWorkingDirectory(DRUPAL_ROOT);
       }
       $proc->start();
-      return ['proc' => $proc, 'range' => [$start, $end], 'started' => microtime(TRUE), 'index' => 0];
+      return [
+        'proc' => $proc,
+        'range' => [$start, $end],
+        'started' => microtime(TRUE),
+        'index' => 0,
+        'stdout' => '',
+        'stderr' => '',
+      ];
     };
 
     $hasMore = static function () use (&$cursor, $min, $max, $descending): bool {
@@ -138,16 +147,18 @@ class BackfillCommands extends DrushCommands {
         ));
         $cursor = $descending ? $start - 1 : $end + 1;
       }
-      // Non-blocking poll.
+      // Non-blocking poll (drain worker stdout/stderr so progress writeln cannot fill the pipe).
       foreach ($running as $i => $slot) {
         /** @var Process $proc */
         $proc = $slot['proc'];
+        $this->drainWorkerProcessOutput($running[$i]);
         if (!$proc->isRunning()) {
+          $this->drainWorkerProcessOutput($running[$i]);
           [$s, $e] = $slot['range'];
           $elapsed = microtime(TRUE) - $slot['started'];
           if ($proc->isSuccessful()) {
             $completed++;
-            $output = trim($proc->getOutput());
+            $output = trim($running[$i]['stdout'] ?? '');
             $chunkStats = $this->parseWorkerStatsFromOutput($output);
             if ($chunkStats) {
               $this->accumulateBackfillTotals($totals, $chunkStats);
@@ -165,7 +176,7 @@ class BackfillCommands extends DrushCommands {
               '[fail %d/%d] FIDs %d-%d after %s (exit %s): %s',
               $completed + $failed, $totalChunks, $s, $e, $this->formatDuration((int) round($elapsed)),
               (string) $proc->getExitCode(),
-              trim($proc->getErrorOutput() ?: $proc->getOutput()),
+              trim(($running[$i]['stderr'] ?? '') ?: ($running[$i]['stdout'] ?? '')),
             ));
           }
           unset($running[$i]);
@@ -689,6 +700,26 @@ class BackfillCommands extends DrushCommands {
     $hours = intdiv($minutes, 60);
     $minutes = $minutes % 60;
     return sprintf('%dh %dm', $hours, $minutes);
+  }
+
+  /**
+   * Appends subprocess stdout/stderr to the worker slot (avoids pipe deadlock).
+   *
+   * Workers emit progress via writeln(); the master must read while they run.
+   *
+   * @param array{proc: Process, stdout?: string, stderr?: string} $slot
+   */
+  protected function drainWorkerProcessOutput(array &$slot): void {
+    /** @var Process $proc */
+    $proc = $slot['proc'];
+    $out = $proc->getIncrementalOutput();
+    if ($out !== '') {
+      $slot['stdout'] = ($slot['stdout'] ?? '') . $out;
+    }
+    $err = $proc->getIncrementalErrorOutput();
+    if ($err !== '') {
+      $slot['stderr'] = ($slot['stderr'] ?? '') . $err;
+    }
   }
 
   protected function formatArgv(array $argv): string {
