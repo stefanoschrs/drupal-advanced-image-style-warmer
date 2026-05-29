@@ -27,6 +27,11 @@ class BackfillCommands extends DrushCommands {
    */
   public const WORKER_STATS_PREFIX = 'AISW_WORKER_STATS';
 
+  /**
+   * Machine-readable in-progress line prefix (parsed by master during backfill).
+   */
+  public const WORKER_PROGRESS_PREFIX = 'AISW_WORKER_PROGRESS';
+
   public function __construct(
     protected Connection $database,
     protected Warmer $warmer,
@@ -190,13 +195,29 @@ class BackfillCommands extends DrushCommands {
           $parts = [];
           foreach ($running as $slot) {
             [$s, $e] = $slot['range'];
-            $parts[] = sprintf('FIDs %d-%d (%s)', $s, $e, $this->formatDuration((int) round($now - $slot['started'])));
+            $elapsed = $this->formatDuration((int) round($now - $slot['started']));
+            $progress = $this->parseLatestWorkerProgressFromStdout($slot['stdout'] ?? '');
+            if ($progress) {
+              $parts[] = sprintf(
+                'chunk %d-%d %d/%d @fid %d (%s)',
+                $s,
+                $e,
+                $progress['scanned'],
+                $progress['total'],
+                $progress['current_fid'],
+                $elapsed,
+              );
+            }
+            else {
+              $parts[] = sprintf('chunk %d-%d (%s, no progress yet)', $s, $e, $elapsed);
+            }
           }
           $this->logBackfill(sprintf(
-            '[heartbeat] %d/%d chunks done, %d failed; %d worker(s) active: %s. Elapsed %s. %s',
+            '[heartbeat] %d/%d chunks done, %d failed; %d worker(s) active: %s. Elapsed %s. %s %s',
             $completed, $totalChunks, $failed, count($running), implode('; ', $parts),
             $this->formatDuration((int) round($now - $masterStartedAt)),
             $this->formatCumulativeTotalsLine($totals),
+            $this->formatInFlightTotalsSuffix($running, $totals),
           ));
           $lastHeartbeat = $now;
         }
@@ -245,6 +266,14 @@ class BackfillCommands extends DrushCommands {
       'Worker %d-%d: %d image file(s) in range; warming style(s) [%s].',
       $startFid, $endFid, $totalInRange, $styles,
     ));
+    $this->output()->writeln(sprintf(
+      '%s start=%d end=%d total=%d order=%s',
+      self::WORKER_PROGRESS_PREFIX,
+      $startFid,
+      $endFid,
+      $totalInRange,
+      $order,
+    ));
 
     $rows = $this->database->select('file_managed', 'f')
       ->fields('f', ['fid', 'uri', 'filemime'])
@@ -261,7 +290,7 @@ class BackfillCommands extends DrushCommands {
     $scanned = 0;
     $skippedWarm = 0;
     $workerStartedAt = microtime(TRUE);
-    $logEvery = max(50, (int) ceil(max(1, $totalInRange) / 20));
+    $logEvery = max(10, (int) ceil(max(1, $totalInRange) / 20));
 
     foreach ($rows as $row) {
       $scanned++;
@@ -269,12 +298,15 @@ class BackfillCommands extends DrushCommands {
       $pending = $this->registry->pendingStylesForFile($fid, $styleNames);
       if (!$pending) {
         $skippedWarm++;
-        if ($totalInRange > 0 && $scanned % $logEvery === 0) {
-          $this->emitWorkerProgress($startFid, $endFid, $scanned, $totalInRange, $skippedWarm, $attempted, $warmedFiles, $failedFiles, $derivatives, $workerStartedAt);
+        if ($scanned === 1 || $scanned % $logEvery === 0) {
+          $this->emitWorkerProgress($startFid, $endFid, $scanned, $totalInRange, $skippedWarm, $attempted, $warmedFiles, $failedFiles, $derivatives, $workerStartedAt, $fid);
         }
         continue;
       }
       $attempted++;
+      if ($attempted === 1) {
+        $this->emitWorkerProgress($startFid, $endFid, $scanned, $totalInRange, $skippedWarm, $attempted, $warmedFiles, $failedFiles, $derivatives, $workerStartedAt, $fid, TRUE);
+      }
       $created = $this->warmer->generateDerivatives($row->uri, $pending, $fid, TRUE);
       $derivatives += $created;
       if ($created > 0) {
@@ -284,7 +316,7 @@ class BackfillCommands extends DrushCommands {
         $failedFiles++;
       }
       if ($attempted % $logEvery === 0 || $scanned % $logEvery === 0) {
-        $this->emitWorkerProgress($startFid, $endFid, $scanned, $totalInRange, $skippedWarm, $attempted, $warmedFiles, $failedFiles, $derivatives, $workerStartedAt);
+        $this->emitWorkerProgress($startFid, $endFid, $scanned, $totalInRange, $skippedWarm, $attempted, $warmedFiles, $failedFiles, $derivatives, $workerStartedAt, $fid);
       }
     }
 
@@ -670,13 +702,17 @@ class BackfillCommands extends DrushCommands {
     int $failedFiles,
     int $derivatives,
     float $workerStartedAt,
+    int $currentFid,
+    bool $warming = FALSE,
   ): void {
-    $line = sprintf(
-      'Worker %d-%d: progress %d/%d — %d skipped, %d attempted, %d ok, %d failed, %d derivatives (%s)',
+    $human = sprintf(
+      'Worker %d-%d: progress %d/%d @fid %d%s — %d skipped, %d attempted, %d ok, %d failed, %d derivatives (%s)',
       $startFid,
       $endFid,
       $scanned,
       $totalInRange,
+      $currentFid,
+      $warming ? ' (warming)' : '',
       $skippedWarm,
       $attempted,
       $warmedFiles,
@@ -684,8 +720,67 @@ class BackfillCommands extends DrushCommands {
       $derivatives,
       $this->formatDuration((int) round(microtime(TRUE) - $workerStartedAt)),
     );
-    $this->logBackfill($line);
-    $this->output()->writeln($line);
+    $machine = sprintf(
+      '%s start=%d end=%d scanned=%d total=%d current_fid=%d skipped_warm=%d attempted=%d warmed_files=%d failed_files=%d derivatives=%d',
+      self::WORKER_PROGRESS_PREFIX,
+      $startFid,
+      $endFid,
+      $scanned,
+      $totalInRange,
+      $currentFid,
+      $skippedWarm,
+      $attempted,
+      $warmedFiles,
+      $failedFiles,
+      $derivatives,
+    );
+    $this->logBackfill($human);
+    $this->output()->writeln($machine);
+  }
+
+  /**
+   * @return array{scanned: int, total: int, current_fid: int, attempted: int, derivatives: int}|null
+   */
+  protected function parseLatestWorkerProgressFromStdout(string $stdout): ?array {
+    if (!preg_match_all(
+      '/' . self::WORKER_PROGRESS_PREFIX . ' start=(\d+) end=(\d+) scanned=(\d+) total=(\d+) current_fid=(\d+) skipped_warm=(\d+) attempted=(\d+) warmed_files=(\d+) failed_files=(\d+) derivatives=(\d+)/',
+      $stdout,
+      $matches,
+      PREG_SET_ORDER,
+    )) {
+      return NULL;
+    }
+    $m = $matches[count($matches) - 1];
+    return [
+      'scanned' => (int) $m[3],
+      'total' => (int) $m[4],
+      'current_fid' => (int) $m[5],
+      'attempted' => (int) $m[7],
+      'derivatives' => (int) $m[10],
+    ];
+  }
+
+  /**
+   * @param array<int, array{stdout?: string}> $running
+   * @param array{scanned: int, skipped_warm: int, attempted: int, warmed_files: int, failed_files: int, derivatives: int, files_in_range: int} $completedTotals
+   */
+  protected function formatInFlightTotalsSuffix(array $running, array $completedTotals): string {
+    $scanned = $completedTotals['scanned'];
+    $attempted = $completedTotals['attempted'] ?? 0;
+    $derivatives = $completedTotals['derivatives'];
+    foreach ($running as $slot) {
+      $p = $this->parseLatestWorkerProgressFromStdout($slot['stdout'] ?? '');
+      if (!$p) {
+        continue;
+      }
+      $scanned += $p['scanned'];
+      $attempted += $p['attempted'];
+      $derivatives += $p['derivatives'];
+    }
+    if ($scanned === $completedTotals['scanned'] && $attempted === ($completedTotals['attempted'] ?? 0)) {
+      return '(in-flight: no worker progress lines yet)';
+    }
+    return sprintf('(in-flight incl. active workers: %d scanned, %d attempted, %d derivatives)', $scanned, $attempted, $derivatives);
   }
 
   protected function formatDuration(int $seconds): string {
